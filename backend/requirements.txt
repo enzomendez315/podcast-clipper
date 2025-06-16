@@ -1,4 +1,4 @@
-pytubefix==9.1.2
+pytubefix
 tqdm
 torch
 opencv-python
