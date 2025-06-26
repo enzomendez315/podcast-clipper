@@ -1,11 +1,16 @@
+import json
 import os
 import pathlib
+import subprocess
+import time
 import uuid
 
 import boto3
 import modal
+import whisperx
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from google import genai
 from pydantic import BaseModel
 
 
@@ -33,18 +38,63 @@ auth_scheme = HTTPBearer()
 
 @app.cls(
     gpu="L40S", timeout=900, retries=0, scaledown_window=20, secrets=[
-        modal.Secret.from_name("podcast-clipper-secret"), modal.Secret.from_name("aws-secret")
+        modal.Secret.from_name("podcast-clipper-secret"), 
+        modal.Secret.from_name("aws-secret"), 
+        modal.Secret.from_name("gemini-secret")
     ], volumes={mount_path: volume}
 )
 class PodcastClipper:
     @modal.enter()
     def load_model(self):
-        print("Loading models")
-        pass
+        print("Loading models...")
+
+        self.whisperx_model = whisperx.load_model("large-v2", device="cuda", compute_type="float16")
+        self.alignment_model, self.metadata = whisperx.load_align_model(language_code="en", device="cuda")
+
+        print("Transcription models loaded...")
+
+        print("Creating Gemini client...")
+        self.gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        print("Created Gemini client...")
+
+    def transcribe_video(self, base_dir: str, video_path: str) -> str:
+        audio_path = base_dir / "audio.wav"
+        extract_cmd = f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+        subprocess.run(extract_cmd, shell=True, check=True, capture_output=True)
+
+        print("Starting transciption with WhisperX...")
+
+        start_time = time.time()
+
+        audio = whisperx.load_audio(str(audio_path))
+        transcipt = self.whisperx_model.transcribe(audio, batch_size=16)
+        result = whisperx.align(
+            transcipt["segments"],
+            self.alignment_model,
+            self.metadata,
+            audio,
+            device="cuda",
+            return_char_alignments=False
+        )
+
+        duration = time.time() - start_time
+
+        print(f"Transcription and alignment took {str(duration)} seconds")
+        
+        segments = []
+
+        if "word_segments" in result:
+            for word_segment in result["word_segments"]:
+                segments.append({
+                    "start": word_segment["start"],
+                    "end": word_segment["end"],
+                    "word": word_segment["word"]
+                })
+
+        return json.dumps(segments)
 
     @modal.fastapi_endpoint(method="POST")
     def process_video(self, request: ProcessVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
-        #print(f"Processing video {request.s3_key}")
         s3_key = request.s3_key
 
         if token.credentials != os.environ["AUTH_TOKEN"]:
@@ -64,7 +114,11 @@ class PodcastClipper:
         s3_client = boto3.client("s3")
         s3_client.download_file("enzo-podcast-clipper", s3_key, str(video_path))
 
-        print(os.listdir(base_dir))
+        # Get transcription
+        transcript_segments_json = self.transcribe_video(base_dir, video_path)
+        transcript_segments = json.loads(transcript_segments_json)
+
+        # Identify moments for clips
 
 
 @app.local_entrypoint()
