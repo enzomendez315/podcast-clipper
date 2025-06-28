@@ -1,6 +1,8 @@
 import json
 import os
 import pathlib
+import pickle
+import shutil
 import subprocess
 import time
 import uuid
@@ -34,6 +36,61 @@ volume = modal.Volume.from_name("podcast-clipper-modal-cache", create_if_missing
 mount_path = "/root/.cache/torch"
 
 auth_scheme = HTTPBearer()
+
+def process_clip(
+        base_dir: str, video_path: str, s3_key: str, start_time: float, 
+        end_time: float, clip_index: int, transcript_segments: list
+    ):
+        clip_name = f"clip_{clip_index}"
+        s3_key_dir = os.path.dirname(s3_key)
+        output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
+        print(f"Output S3 key: {output_s3_key}")
+
+        clip_dir = base_dir / clip_name
+        clip_dir.mkdir(parents=True, exist_ok=True)
+
+        # Segment clip from start to end
+        clip_segment_path = clip_dir / f"{clip_name}_segment.mp4"
+        vertical_mp4_path = clip_dir / "pyavi" / "video_out_vertical.mp4"
+        subtitle_output_path = clip_dir / "pyavi" / "video_with_subtitles.mp4"
+
+        (clip_dir / "pywork").mkdir(exist_ok=True)
+        pyframes_path = clip_dir / "pyframes"
+        pyavi_path = clip_dir / "pyavi"
+        audio_path = clip_dir / "pyavi" / "audio.wav"
+
+        pyframes_path.mkdir(exist_ok=True)
+        pyavi_path.mkdir(exist_ok=True)
+
+        # Cut clip
+        duration = end_time - start_time
+        cut_command = (f"ffmpeg -i {video_path} --ss {start_time} -t {duration} {clip_segment_path}")
+        subprocess.run(cut_command, shell=True, check=True, capture_output=True, text=True)
+
+        # Extract audio
+        extract_cmd = f"ffmpeg -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+        subprocess.run(extract_cmd, shell=True, check=True, capture_output=True)
+
+        shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
+        columbia_cmd = (f"python Columbia_test.py --videoName {clip_name}"
+                        f"--videoFolder {str(base_dir)} --pretrainModel weight/finetuning_TalkSet.model")
+        
+        columbia_start = time.time()
+        subprocess.run(columbia_cmd, cwd="/LR-ASD", shell=True)
+        columbia_duration = time.time() - columbia_start
+        print(f"Columbia script duration is {columbia_duration:.2f} seconds")
+
+        tracks_path = clip_dir / "pywork" / "tracks.pckl"
+        scores_path = clip_dir / "pywork" / "scores.pckl"
+
+        if not tracks_path.exists() or not scores_path.exists():
+            raise FileNotFoundError("Tracks or scores not found for clip")
+        
+        with open(tracks_path, "rb") as f:
+            tracks = pickle.load(f)
+
+        with open(tracks_path, "rb") as f:
+            scores = pickle.load(f)
 
 
 @app.cls(
@@ -150,6 +207,31 @@ class PodcastClipper:
         # Identify moments for clips
         print("Identifying clip moments...")
         identified_moments_raw = self.identify_moments(transcript_segments)
+
+        cleaned_json_str = identified_moments_raw.strip()
+        if cleaned_json_str.startswith("```json"):
+            cleaned_json_str = cleaned_json_str[len("```json"):].strip()
+        if cleaned_json_str.endswith("```"):
+            cleaned_json_str = cleaned_json_str[:-len("```")].strip()
+
+        clip_moments = json.loads(cleaned_json_str)
+        if not clip_moments or not isinstance(clip_moments, list):
+            print("Error: Identified moments is not a list")
+            clip_moments = []
+
+        print(clip_moments)
+
+        # Process the first three clips
+        for index, moment in enumerate(clip_moments[:3]):
+            if "start" in moment and "end" in moment:
+                print(f"Processing clip {str(index)} from {str(moment["start"])} to {str(moment["end"])}")
+                process_clip(
+                    base_dir, video_path, s3_key, moment["start"], moment["end"], index, transcript_segments
+                )
+
+        if base_dir.exists():
+            print(f"Cleaning up temp directory after {base_dir}")
+            shutil.rmtree(base_dir, ignore_errors=True)
 
 
 @app.local_entrypoint()
